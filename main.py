@@ -15,7 +15,7 @@ import sys
 from loguru import logger
 
 from src.config import (
-    ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ANALYST_TIMEZONE
+    GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ANALYST_TIMEZONE
 )
 from src.memory.memory_manager import MemoryManager
 from src.agent.analyst_agent import FinancialAnalystAgent
@@ -45,8 +45,8 @@ logger.add(
 def validate_config() -> bool:
     """Check that required environment variables are set."""
     missing = []
-    if not ANTHROPIC_API_KEY:
-        missing.append("ANTHROPIC_API_KEY")
+    if not GOOGLE_API_KEY:
+        missing.append("GOOGLE_API_KEY")
     if not TELEGRAM_BOT_TOKEN:
         missing.append("TELEGRAM_BOT_TOKEN")
     if not TELEGRAM_CHAT_ID:

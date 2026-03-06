@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── API Keys ──────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -31,7 +31,7 @@ INSTRUMENT_GROUPS = {
 }
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-CLAUDE_MODEL: str = "claude-opus-4-6"
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 # ── Storage paths ─────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent.parent

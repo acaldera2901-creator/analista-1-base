@@ -1,5 +1,5 @@
 """
-Core Financial Analyst Agent — powered by Claude Opus 4.6 with adaptive thinking.
+Core Financial Analyst Agent — powered by Google Gemini 2.0 Flash.
 
 This agent:
 - Generates the morning market briefing at 7:30
@@ -13,11 +13,12 @@ import json
 from datetime import datetime
 from typing import Generator
 
-import anthropic
+from google import genai
+from google.genai import types
 from loguru import logger
 
 from src.config import (
-    CLAUDE_MODEL, ANTHROPIC_API_KEY, INSTRUMENTS, INSTRUMENT_GROUPS,
+    GEMINI_MODEL, GOOGLE_API_KEY, INSTRUMENTS, INSTRUMENT_GROUPS,
     ANALYST_TIMEZONE,
 )
 from src.memory.memory_manager import MemoryManager
@@ -136,12 +137,12 @@ Usa dati e contesto dalla tua memoria e dall'ultimo aggiornamento di mercato dis
 
 
 class FinancialAnalystAgent:
-    """The core analyst agent — orchestrates data, memory, and Claude."""
+    """The core analyst agent — orchestrates data, memory, and Gemini."""
 
     def __init__(self, memory: MemoryManager):
         self.memory = memory
-        self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        self.conversation_history: list[dict] = []
+        self.client = genai.Client(api_key=GOOGLE_API_KEY)
+        self.conversation_history: list[types.Content] = []
         self._last_wm_snapshot: WorldMonitorSnapshot | None = None
         self._last_ff_snapshot: ForexFactorySnapshot | None = None
 
@@ -170,8 +171,7 @@ class FinancialAnalystAgent:
         if not self._last_wm_snapshot:
             return "Dati WorldMonitor non ancora disponibili."
         snap = self._last_wm_snapshot
-        # Send the full raw text (Claude will extract what matters)
-        text = snap.raw_text[:8000]  # limit to avoid token overflow
+        text = snap.raw_text[:8000]
         return f"Timestamp: {snap.timestamp}\n\n{text}"
 
     def _format_ff_data(self) -> str:
@@ -195,11 +195,23 @@ class FinancialAnalystAgent:
         if snap.currencies_in_focus:
             parts.append(f"Valute in focus: {', '.join(snap.currencies_in_focus)}")
 
-        # Add raw text for additional context (truncated)
         raw_preview = snap.raw_text[:4000]
         parts.append(f"\n--- CALENDARIO COMPLETO (preview) ---\n{raw_preview}")
 
         return "\n".join(parts)
+
+    def _call_gemini(self, prompt: str, system: str, max_tokens: int = 8192) -> str:
+        """Single non-streaming Gemini call, returns full text."""
+        response = self.client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                max_output_tokens=max_tokens,
+                temperature=0.7,
+            ),
+        )
+        return response.text or ""
 
     # ── Morning briefing ──────────────────────────────────────────────────────
 
@@ -219,20 +231,8 @@ class FinancialAnalystAgent:
         system = self._build_system_prompt()
 
         try:
-            with self.client.messages.stream(
-                model=CLAUDE_MODEL,
-                max_tokens=8192,
-                thinking={"type": "adaptive"},
-                system=system,
-                messages=[{"role": "user", "content": prompt}],
-            ) as stream:
-                response = stream.get_final_message()
+            analysis = self._call_gemini(prompt, system, max_tokens=8192)
 
-            analysis = next(
-                (b.text for b in response.content if b.type == "text"), ""
-            )
-
-            # Persist
             raw_data = {
                 "worldmonitor_text": self._format_wm_data(),
                 "ff_events_today": self._last_ff_snapshot.events_today if self._last_ff_snapshot else [],
@@ -267,19 +267,7 @@ class FinancialAnalystAgent:
         system = self._build_system_prompt()
 
         try:
-            with self.client.messages.stream(
-                model=CLAUDE_MODEL,
-                max_tokens=3000,
-                thinking={"type": "adaptive"},
-                system=system,
-                messages=[{"role": "user", "content": prompt}],
-            ) as stream:
-                response = stream.get_final_message()
-
-            analysis = next(
-                (b.text for b in response.content if b.type == "text"), ""
-            )
-
+            analysis = self._call_gemini(prompt, system, max_tokens=3000)
             self.memory.save_alert(alert_type, analysis, trigger_data)
             logger.info(f"Alert generated: {len(analysis)} chars")
             return analysis
@@ -295,47 +283,52 @@ class FinancialAnalystAgent:
         Stream a response to a user message, maintaining conversation history.
         Yields text chunks as they arrive.
         """
-        # Add user message to history
-        self.conversation_history.append({
-            "role": "user",
-            "content": user_message,
-        })
-
         system = self._build_system_prompt() + "\n\n" + CONVERSATION_SYSTEM_ADDITION
 
-        # Add current market data context for first message
-        market_context = ""
-        if len(self.conversation_history) == 1:
+        # Enrich first message with market data context
+        if not self.conversation_history:
             market_context = (
                 f"\n\nDati di mercato correnti:\n"
                 f"WorldMonitor: {self._format_wm_data()[:1500]}\n"
                 f"ForexFactory: {self._format_ff_data()[:1500]}"
             )
-            self.conversation_history[0]["content"] += market_context
+            user_message_full = user_message + market_context
+        else:
+            user_message_full = user_message
+
+        self.conversation_history.append(
+            types.Content(role="user", parts=[types.Part(text=user_message_full)])
+        )
 
         try:
             full_response = ""
-            with self.client.messages.stream(
-                model=CLAUDE_MODEL,
-                max_tokens=4096,
-                thinking={"type": "adaptive"},
-                system=system,
-                messages=self.conversation_history,
-            ) as stream:
-                for text_chunk in stream.text_stream:
-                    full_response += text_chunk
-                    yield text_chunk
+            for chunk in self.client.models.generate_content_stream(
+                model=GEMINI_MODEL,
+                contents=self.conversation_history,
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    max_output_tokens=4096,
+                    temperature=0.7,
+                ),
+            ):
+                chunk_text = chunk.text or ""
+                full_response += chunk_text
+                yield chunk_text
 
             # Add assistant response to history
-            self.conversation_history.append({
-                "role": "assistant",
-                "content": full_response,
-            })
+            self.conversation_history.append(
+                types.Content(role="model", parts=[types.Part(text=full_response)])
+            )
 
             # Persist conversation periodically (every 10 turns)
             if len(self.conversation_history) % 10 == 0:
+                history_dicts = [
+                    {"role": c.role, "content": c.parts[0].text}
+                    for c in self.conversation_history
+                    if c.parts
+                ]
                 self.memory.save_conversation(
-                    self.conversation_history,
+                    history_dicts,
                     summary=f"Conversazione in corso ({len(self.conversation_history)} messaggi)",
                 )
 
@@ -346,8 +339,13 @@ class FinancialAnalystAgent:
     def reset_conversation(self) -> None:
         """Save and reset the current conversation."""
         if self.conversation_history:
+            history_dicts = [
+                {"role": c.role, "content": c.parts[0].text}
+                for c in self.conversation_history
+                if c.parts
+            ]
             self.memory.save_conversation(
-                self.conversation_history,
+                history_dicts,
                 summary=f"Sessione chiusa ({len(self.conversation_history)} messaggi)",
             )
         self.conversation_history = []
@@ -369,7 +367,6 @@ class FinancialAnalystAgent:
         snap = self._last_ff_snapshot
 
         # Alert for high-impact events happening very soon (within 30 minutes)
-        now_str = datetime.now().strftime("%H:%M")
         for ev in snap.high_impact_upcoming:
             ev_time = ev.get("time", "")
             if ev_time and self._is_soon(ev_time, minutes=30):

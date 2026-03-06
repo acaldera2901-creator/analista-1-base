@@ -17,10 +17,12 @@ from datetime import datetime
 from typing import Optional
 
 import requests
+from google import genai
+from google.genai import types
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from src.config import REQUEST_HEADERS, REQUEST_TIMEOUT
+from src.config import REQUEST_HEADERS, REQUEST_TIMEOUT, GOOGLE_API_KEY, GEMINI_MODEL
 
 WORLDMONITOR_URL = "https://www.worldmonitor.app"
 
@@ -270,6 +272,12 @@ class WorldMonitorScraper:
         instrument_prices = {k: v for k, v in prices.items() if k not in context_keys}
 
         raw_text = self._build_summary(instrument_prices, central_banks, indicators, news, market_context)
+
+        # Enrich with real worldmonitor.app data via Gemini URL context
+        wm_live = self.fetch_worldmonitor_via_gemini()
+        if wm_live:
+            raw_text += f"\n\n── WORLDMONITOR.APP (via Gemini) ──\n{wm_live}"
+
         logger.info(f"Macro data ready: {len(raw_text)} chars")
 
         return WorldMonitorSnapshot(
@@ -332,6 +340,44 @@ class WorldMonitorScraper:
                     lines.append(f"  [{item.get('source','')}] {t}")
 
         return "\n".join(lines)
+
+    # ── Gemini URL context (worldmonitor.app) ─────────────────────────────────
+
+    def fetch_worldmonitor_via_gemini(self) -> str:
+        """
+        Use Gemini's URL context capability to read worldmonitor.app directly.
+        Returns a text summary of the macro data visible on the page.
+        Falls back to empty string on failure.
+        """
+        if not GOOGLE_API_KEY:
+            return ""
+        try:
+            client = genai.Client(api_key=GOOGLE_API_KEY)
+            prompt = (
+                "Accedi a https://www.worldmonitor.app e riassumi in modo strutturato "
+                "tutti i dati macro visibili: tassi banche centrali, inflazione, PIL, "
+                "occupazione, rendimenti obbligazionari, indicatori di sentiment. "
+                "Includi i valori numerici attuali e eventuali variazioni."
+            )
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            file_data=types.FileData(file_uri="https://www.worldmonitor.app")
+                        ),
+                        types.Part(text=prompt),
+                    ],
+                ),
+                config=types.GenerateContentConfig(max_output_tokens=4096),
+            )
+            text = response.text or ""
+            logger.info(f"worldmonitor.app via Gemini: {len(text)} chars")
+            return text
+        except Exception as e:
+            logger.warning(f"Gemini URL fetch for worldmonitor.app failed: {e}")
+            return ""
 
     def to_dict(self, snapshot: WorldMonitorSnapshot) -> dict:
         return asdict(snapshot)

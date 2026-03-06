@@ -1,16 +1,17 @@
 """
 Self-Improvement Engine — periodically reviews past analyses,
 identifies strengths/weaknesses, and updates the analyst profile.
-Uses Claude to perform the meta-analysis.
+Uses Gemini to perform the meta-analysis.
 """
 
 import json
 from datetime import datetime
 
-import anthropic
+from google import genai
+from google.genai import types
 from loguru import logger
 
-from src.config import CLAUDE_MODEL, SELF_IMPROVEMENT_LOOKBACK, ANTHROPIC_API_KEY
+from src.config import GEMINI_MODEL, SELF_IMPROVEMENT_LOOKBACK, GOOGLE_API_KEY
 from src.memory.memory_manager import MemoryManager
 
 
@@ -46,7 +47,7 @@ class SelfImprovementEngine:
 
     def __init__(self, memory: MemoryManager):
         self.memory = memory
-        self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        self.client = genai.Client(api_key=GOOGLE_API_KEY)
 
     def should_run_review(self) -> bool:
         """Decide if a self-improvement review should run now."""
@@ -89,17 +90,15 @@ class SelfImprovementEngine:
         )
 
         try:
-            with self.client.messages.stream(
-                model=CLAUDE_MODEL,
-                max_tokens=4096,
-                thinking={"type": "adaptive"},
-                messages=[{"role": "user", "content": prompt}],
-            ) as stream:
-                response = stream.get_final_message()
-
-            text = next(
-                (b.text for b in response.content if b.type == "text"), ""
+            response = self.client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=4096,
+                    temperature=0.3,
+                ),
             )
+            text = response.text or ""
 
             # Extract JSON from response
             review = self._parse_json_response(text)
