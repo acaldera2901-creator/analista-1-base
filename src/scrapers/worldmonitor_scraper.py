@@ -346,8 +346,8 @@ class WorldMonitorScraper:
     def fetch_worldmonitor_via_gemini(self) -> str:
         """
         Use Gemini's URL context capability to read worldmonitor.app directly.
-        Returns a text summary of the macro data visible on the page.
-        Falls back to empty string on failure.
+        Only works in environments where generativelanguage.googleapis.com is accessible.
+        Falls back to empty string on failure (e.g. cloud sandboxes where Gemini is blocked).
         """
         if not GOOGLE_API_KEY:
             return ""
