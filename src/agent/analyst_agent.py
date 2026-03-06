@@ -1,29 +1,28 @@
 """
-Core Financial Analyst Agent — powered by Google Gemini 2.0 Flash.
+Core Financial Analyst Agent.
 
-This agent:
-- Generates the morning market briefing at 7:30
-- Produces proactive alerts for high-impact events
-- Responds to user queries in a multi-turn conversation
-- Integrates WorldMonitor + ForexFactory data
-- Evolves via the self-improvement engine
+Supports multiple LLM providers via src/llm_client.py:
+  - Gemini 2.0 Flash  (GOOGLE_API_KEY)
+  - Groq / Llama 3.3  (GROQ_API_KEY)
+  - OpenRouter        (OPENROUTER_API_KEY)
+  - Anthropic Claude  (ANTHROPIC_API_KEY)
+
+Set LLM_PROVIDER=gemini|groq|openrouter|anthropic in .env to force a provider.
 """
 
 import json
 from datetime import datetime
 from typing import Generator
 
-from google import genai
-from google.genai import types
 from loguru import logger
 
 from src.config import (
-    GEMINI_MODEL, GOOGLE_API_KEY, INSTRUMENTS, INSTRUMENT_GROUPS,
-    ANALYST_TIMEZONE,
+    INSTRUMENTS, INSTRUMENT_GROUPS, ANALYST_TIMEZONE,
 )
 from src.memory.memory_manager import MemoryManager
 from src.scrapers.worldmonitor_scraper import WorldMonitorSnapshot
 from src.scrapers.forexfactory_scraper import ForexFactorySnapshot
+from src.llm_client import build_llm_client
 
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
@@ -75,27 +74,27 @@ Calendario ForexFactory (oggi e settimana):
 ---
 Presenta la RIUNIONE MATTUTINA completa seguendo questo schema:
 
-# 📊 BRIEFING MATTUTINO — {date}
+# BRIEFING MATTUTINO — {date}
 
-## 1. 🌍 MACRO OVERVIEW
+## 1. MACRO OVERVIEW
 [Quadro macro globale: banche centrali, tassi, inflazione, risk appetite]
 
-## 2. 📅 EVENTI CHIAVE OGGI E QUESTA SETTIMANA
+## 2. EVENTI CHIAVE OGGI E QUESTA SETTIMANA
 [Lista eventi ForexFactory ad alto impatto con ora, valuta e aspettativa]
 
-## 3. 💱 ANALISI PER STRUMENTO
+## 3. ANALISI PER STRUMENTO
 Per ciascuno di questi strumenti: {instruments}
 - Bias direzionale (rialzista/ribassista/neutro)
 - Catalizzatori principali
 - Livelli chiave da monitorare
 
-## 4. 🎯 TRADE IDEAS SPECULATIVE
+## 4. TRADE IDEAS SPECULATIVE
 [2-3 opportunità speculative con ragionamento, entry area, target, invalidation]
 
-## 5. ⚠️ RISCHI E INCOGNITE
+## 5. RISCHI E INCOGNITE
 [Cosa potrebbe sorprendere il mercato oggi]
 
-## 6. 🧠 NOTE DALL'ANALISTA
+## 6. NOTE DALL'ANALISTA
 [Considerazioni personali, pattern visti di recente, raccomandazioni operative]
 """
 
@@ -111,9 +110,9 @@ Contesto di mercato corrente:
 ---
 Genera un ALERT PROATTIVO conciso e actionable:
 
-# 🚨 ALERT: {alert_type}
+# ALERT: {alert_type}
 
-## Cosa è successo
+## Cosa e' successo
 [Descrizione sintetica dell'evento]
 
 ## Impatto atteso sui mercati
@@ -137,12 +136,12 @@ Usa dati e contesto dalla tua memoria e dall'ultimo aggiornamento di mercato dis
 
 
 class FinancialAnalystAgent:
-    """The core analyst agent — orchestrates data, memory, and Gemini."""
+    """The core analyst agent — provider-agnostic via src/llm_client."""
 
     def __init__(self, memory: MemoryManager):
         self.memory = memory
-        self.client = genai.Client(api_key=GOOGLE_API_KEY)
-        self.conversation_history: list[types.Content] = []
+        self._llm = build_llm_client()
+        self.conversation_history: list[dict] = []
         self._last_wm_snapshot: WorldMonitorSnapshot | None = None
         self._last_ff_snapshot: ForexFactorySnapshot | None = None
 
@@ -153,7 +152,6 @@ class FinancialAnalystAgent:
         wm_snapshot: WorldMonitorSnapshot | None = None,
         ff_snapshot: ForexFactorySnapshot | None = None,
     ) -> None:
-        """Update the agent's in-memory market data snapshots."""
         if wm_snapshot:
             self._last_wm_snapshot = wm_snapshot
         if ff_snapshot:
@@ -171,8 +169,7 @@ class FinancialAnalystAgent:
         if not self._last_wm_snapshot:
             return "Dati WorldMonitor non ancora disponibili."
         snap = self._last_wm_snapshot
-        text = snap.raw_text[:8000]
-        return f"Timestamp: {snap.timestamp}\n\n{text}"
+        return f"Timestamp: {snap.timestamp}\n\n{snap.raw_text[:8000]}"
 
     def _format_ff_data(self) -> str:
         if not self._last_ff_snapshot:
@@ -186,63 +183,39 @@ class FinancialAnalystAgent:
                 parts.append(
                     f"  {ev.get('date','')} {ev.get('time','')} "
                     f"[{ev.get('currency','')}] {ev.get('title','')} "
-                    f"— Atteso: {ev.get('forecast','')} | Prec: {ev.get('previous','')}"
+                    f"-- Atteso: {ev.get('forecast','')} | Prec: {ev.get('previous','')}"
                 )
 
         if snap.recurring_themes:
             parts.append(f"\nTemi ricorrenti: {', '.join(snap.recurring_themes)}")
-
         if snap.currencies_in_focus:
             parts.append(f"Valute in focus: {', '.join(snap.currencies_in_focus)}")
 
-        raw_preview = snap.raw_text[:4000]
-        parts.append(f"\n--- CALENDARIO COMPLETO (preview) ---\n{raw_preview}")
-
+        parts.append(f"\n--- CALENDARIO COMPLETO (preview) ---\n{snap.raw_text[:4000]}")
         return "\n".join(parts)
-
-    def _call_gemini(self, prompt: str, system: str, max_tokens: int = 8192) -> str:
-        """Single non-streaming Gemini call, returns full text."""
-        response = self.client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system,
-                max_output_tokens=max_tokens,
-                temperature=0.7,
-            ),
-        )
-        return response.text or ""
 
     # ── Morning briefing ──────────────────────────────────────────────────────
 
     def generate_morning_briefing(self) -> str:
-        """Generate the daily 7:30 morning briefing."""
         logger.info("Generating morning briefing...")
         today = datetime.now().strftime("%d/%m/%Y")
-        instruments_str = ", ".join(INSTRUMENTS)
-
         prompt = MORNING_BRIEFING_PROMPT.format(
             date=today,
             worldmonitor_data=self._format_wm_data(),
             forexfactory_data=self._format_ff_data(),
-            instruments=instruments_str,
+            instruments=", ".join(INSTRUMENTS),
         )
-
         system = self._build_system_prompt()
-
         try:
-            analysis = self._call_gemini(prompt, system, max_tokens=8192)
-
+            analysis = self._llm.call(prompt, system, max_tokens=8192)
             raw_data = {
                 "worldmonitor_text": self._format_wm_data(),
                 "ff_events_today": self._last_ff_snapshot.events_today if self._last_ff_snapshot else [],
                 "ff_high_impact": self._last_ff_snapshot.high_impact_upcoming if self._last_ff_snapshot else [],
             }
             self.memory.save_morning_briefing(analysis, raw_data)
-
             logger.info(f"Morning briefing generated: {len(analysis)} chars")
             return analysis
-
         except Exception as e:
             logger.error(f"Morning briefing generation failed: {e}")
             raise
@@ -250,28 +223,22 @@ class FinancialAnalystAgent:
     # ── Proactive alerts ──────────────────────────────────────────────────────
 
     def generate_proactive_alert(self, alert_type: str, trigger_data: dict) -> str:
-        """Generate a proactive market alert."""
         logger.info(f"Generating proactive alert: {alert_type}")
-
         market_context = (
             f"WorldMonitor: {self._format_wm_data()[:2000]}\n"
             f"ForexFactory: {self._format_ff_data()[:2000]}"
         )
-
         prompt = PROACTIVE_ALERT_PROMPT.format(
             alert_type=alert_type,
             trigger_data=json.dumps(trigger_data, ensure_ascii=False, indent=2),
             market_context=market_context,
         )
-
         system = self._build_system_prompt()
-
         try:
-            analysis = self._call_gemini(prompt, system, max_tokens=3000)
+            analysis = self._llm.call(prompt, system, max_tokens=3000)
             self.memory.save_alert(alert_type, analysis, trigger_data)
             logger.info(f"Alert generated: {len(analysis)} chars")
             return analysis
-
         except Exception as e:
             logger.error(f"Alert generation failed: {e}")
             raise
@@ -279,10 +246,7 @@ class FinancialAnalystAgent:
     # ── Interactive conversation ───────────────────────────────────────────────
 
     def chat(self, user_message: str) -> Generator[str, None, None]:
-        """
-        Stream a response to a user message, maintaining conversation history.
-        Yields text chunks as they arrive.
-        """
+        """Stream a response, maintaining conversation history."""
         system = self._build_system_prompt() + "\n\n" + CONVERSATION_SYSTEM_ADDITION
 
         # Enrich first message with market data context
@@ -297,35 +261,25 @@ class FinancialAnalystAgent:
             user_message_full = user_message
 
         self.conversation_history.append(
-            types.Content(role="user", parts=[types.Part(text=user_message_full)])
+            self._llm.make_message("user", user_message_full)
         )
 
         try:
             full_response = ""
-            for chunk in self.client.models.generate_content_stream(
-                model=GEMINI_MODEL,
-                contents=self.conversation_history,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    max_output_tokens=4096,
-                    temperature=0.7,
-                ),
-            ):
-                chunk_text = chunk.text or ""
-                full_response += chunk_text
-                yield chunk_text
+            for chunk in self._llm.stream(self.conversation_history, system, max_tokens=4096):
+                full_response += chunk
+                yield chunk
 
-            # Add assistant response to history
+            assistant_role = self._llm.assistant_role()
             self.conversation_history.append(
-                types.Content(role="model", parts=[types.Part(text=full_response)])
+                self._llm.make_message(assistant_role, full_response)
             )
 
-            # Persist conversation periodically (every 10 turns)
+            # Persist conversation periodically
             if len(self.conversation_history) % 10 == 0:
                 history_dicts = [
-                    {"role": c.role, "content": c.parts[0].text}
-                    for c in self.conversation_history
-                    if c.parts
+                    {"role": m["role"], "content": m["content"]}
+                    for m in self.conversation_history
                 ]
                 self.memory.save_conversation(
                     history_dicts,
@@ -337,12 +291,10 @@ class FinancialAnalystAgent:
             raise
 
     def reset_conversation(self) -> None:
-        """Save and reset the current conversation."""
         if self.conversation_history:
             history_dicts = [
-                {"role": c.role, "content": c.parts[0].text}
-                for c in self.conversation_history
-                if c.parts
+                {"role": m["role"], "content": m["content"]}
+                for m in self.conversation_history
             ]
             self.memory.save_conversation(
                 history_dicts,
@@ -353,20 +305,14 @@ class FinancialAnalystAgent:
     def get_conversation_length(self) -> int:
         return len(self.conversation_history)
 
-    # ── Market data freshness check ───────────────────────────────────────────
+    # ── Alert check ───────────────────────────────────────────────────────────
 
     def check_for_alerts(self) -> list[dict]:
-        """
-        Analyze fresh data and determine if any proactive alerts should be sent.
-        Returns a list of alert dicts: {type, trigger_data, priority}.
-        """
         alerts = []
         if not self._last_ff_snapshot:
             return alerts
-
         snap = self._last_ff_snapshot
 
-        # Alert for high-impact events happening very soon (within 30 minutes)
         for ev in snap.high_impact_upcoming:
             ev_time = ev.get("time", "")
             if ev_time and self._is_soon(ev_time, minutes=30):
@@ -376,7 +322,6 @@ class FinancialAnalystAgent:
                     "priority": "high",
                 })
 
-        # Alert for surprising data (beat/miss on high-impact events)
         for ev in snap.events_today:
             if ev.get("surprise") in ("beat", "miss") and ev.get("is_high_impact"):
                 alerts.append({
@@ -384,12 +329,10 @@ class FinancialAnalystAgent:
                     "trigger_data": ev,
                     "priority": "critical",
                 })
-
         return alerts
 
     @staticmethod
     def _is_soon(time_str: str, minutes: int = 30) -> bool:
-        """Check if a given HH:MM time is within `minutes` from now."""
         try:
             now = datetime.now()
             event_time = datetime.strptime(time_str, "%H:%M").replace(

@@ -30,8 +30,25 @@ INSTRUMENT_GROUPS = {
     "crypto": ["BTCUSD"],
 }
 
-# ── Model ─────────────────────────────────────────────────────────────────────
+# ── LLM Provider ──────────────────────────────────────────────────────────────
+# Set LLM_PROVIDER to force a provider: gemini | groq | openrouter | anthropic
+# If not set, auto-detected from available API keys (priority: gemini > groq > openrouter > anthropic)
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "")
+
+# Gemini
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+# Groq (free, fast — https://console.groq.com)
+GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+# OpenRouter (routes to many models — https://openrouter.ai)
+OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free")
+
+# Anthropic
+ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL: str = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
 # ── Storage paths ─────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent.parent
