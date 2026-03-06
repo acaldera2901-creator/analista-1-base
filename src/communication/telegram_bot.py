@@ -10,7 +10,8 @@ Features:
 """
 
 import asyncio
-import textwrap
+import base64
+import io
 from typing import Optional
 
 from telegram import Update, Bot
@@ -25,7 +26,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from loguru import logger
 
-from src.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from src.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GROQ_API_KEY
 from src.agent.analyst_agent import FinancialAnalystAgent
 from src.memory.memory_manager import MemoryManager
 from src.memory.self_improvement import SelfImprovementEngine
@@ -97,6 +98,11 @@ class TelegramCommunicator:
         # Handle regular text messages as analyst queries
         self.app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message)
+        )
+
+        # Handle photos (chart screenshots) — with or without caption
+        self.app.add_handler(
+            MessageHandler(filters.PHOTO, self._handle_photo)
         )
 
         return self.app
@@ -264,6 +270,45 @@ class TelegramCommunicator:
                 f"Errore durante l'analisi: {str(e)[:200]}"
             )
 
+    # ── Photo/chart handler ────────────────────────────────────────────────────
+
+    async def _handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Analyse a chart screenshot sent by the user via Groq Vision."""
+        if not self._is_authorized(update):
+            return
+
+        caption = update.message.caption or "Analizza questo grafico. Cosa noti? Qual e' il tuo giudizio tecnico e speculativo?"
+        logger.info(f"Photo received, caption: {caption[:80]}")
+
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id, action="typing"
+        )
+
+        try:
+            # Download highest-resolution photo
+            photo = update.message.photo[-1]
+            tg_file = await photo.get_file()
+            img_bytes = await tg_file.download_as_bytearray()
+            b64_image = base64.b64encode(img_bytes).decode("utf-8")
+
+            loop = asyncio.get_event_loop()
+
+            def _vision_call():
+                return _groq_vision(
+                    b64_image=b64_image,
+                    user_text=caption,
+                    system=self.agent._build_system_prompt(),
+                )
+
+            response = await loop.run_in_executor(None, _vision_call)
+            await self._safe_reply(update, response)
+
+        except Exception as e:
+            logger.error(f"Photo handler error: {e}")
+            await update.message.reply_text(
+                f"Errore nell'analisi del grafico: {str(e)[:200]}"
+            )
+
     # ── Proactive sending (called by scheduler) ───────────────────────────────
 
     async def send_message(self, text: str) -> None:
@@ -309,3 +354,60 @@ class TelegramCommunicator:
                 await self.send_message(f"Auto-miglioramento completato\n\n{summary}")
         except Exception as e:
             logger.error(f"Background improvement error: {e}")
+
+
+# ── Groq Vision helper (module-level) ────────────────────────────────────────
+
+def _groq_vision(b64_image: str, user_text: str, system: str) -> str:
+    """
+    Send a base64-encoded image + text to Groq's vision model.
+    Uses meta-llama/llama-4-scout-17b-16e-instruct (supports vision).
+    Falls back to plain text analysis if vision unavailable.
+    """
+    if not GROQ_API_KEY:
+        return "Nessuna chiave Groq configurata per l'analisi visiva."
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=GROQ_API_KEY,
+        )
+
+        full_prompt = (
+            "Sei Marco, Senior Speculative Financial Analyst di un hedge fund.\n"
+            "Analizza il grafico finanziario nell'immagine seguendo questo schema:\n\n"
+            "1. STRUTTURA E TIMEFRAME: Cosa mostri il grafico (strumento, TF, pattern visibili)\n"
+            "2. TREND E MOMENTUM: Direzione dominante, forza del trend\n"
+            "3. LIVELLI CHIAVE: Supporti, resistenze, zone demand/supply visibili\n"
+            "4. PATTERN TECNICI: Formazioni candlestick, pattern grafici rilevanti\n"
+            "5. BIAS OPERATIVO: Long/Short/Neutro con motivazione\n"
+            "6. TRADE SETUP: Entry, target, invalidazione\n\n"
+            f"Domanda/contesto utente: {user_text}"
+        )
+
+        response = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{b64_image}"
+                            },
+                        },
+                        {"type": "text", "text": full_prompt},
+                    ],
+                },
+            ],
+            max_tokens=1500,
+            temperature=0.7,
+        )
+        return response.choices[0].message.content or "Nessuna risposta dal modello."
+
+    except Exception as e:
+        logger.error(f"Groq vision error: {e}")
+        return f"Errore analisi visiva: {str(e)[:200]}"
