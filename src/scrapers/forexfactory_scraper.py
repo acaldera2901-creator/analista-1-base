@@ -1,175 +1,148 @@
 """
-ForexFactory scraper — fetches the economic calendar, high-impact events,
-and recurring news items from forexfactory.com
+Economic Calendar Scraper — uses TradingView's public economic calendar API
+as primary source (equivalent to ForexFactory) plus Investing.com RSS.
+
+TradingView calendar endpoint is publicly accessible with proper headers.
+Covers all major currencies: USD, EUR, GBP, JPY, AUD, CAD, CHF, NZD.
 """
 
 import time
-import json
-from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import requests
-from bs4 import BeautifulSoup
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from src.config import FOREXFACTORY_URL, REQUEST_HEADERS, REQUEST_TIMEOUT
+from src.config import REQUEST_HEADERS, REQUEST_TIMEOUT
 
+FOREXFACTORY_URL = "https://www.forexfactory.com"
 
-@dataclass
-class ForexEvent:
-    date: str
-    time: str
-    currency: str
-    impact: str          # low / medium / high / holiday
-    title: str
-    actual: str
-    forecast: str
-    previous: str
-    surprise: str        # beat / miss / inline / unknown
-    is_high_impact: bool
+# TradingView calendar API
+TV_CALENDAR_URL = "https://economic-calendar.tradingview.com/events"
+
+# TradingView importance: 1=high, 0=medium, -1=low
+IMPORTANCE_MAP = {1: "high", 0: "medium", -1: "low"}
+
+# Currencies we care about (our instruments + Gold/BTC drivers)
+MONITORED_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "AUD", "CHF", "CAD", "NZD"}
 
 
 @dataclass
 class ForexFactorySnapshot:
     timestamp: str
-    events_today: list[dict]
-    events_week: list[dict]
-    high_impact_upcoming: list[dict]
-    recurring_themes: list[str]
-    currencies_in_focus: list[str]
+    events_today: list
+    events_week: list
+    high_impact_upcoming: list
+    recurring_themes: list
+    currencies_in_focus: list
     raw_text: str
 
 
-# Map ForexFactory impact indicators to labels
-IMPACT_MAP = {
-    "red": "high",
-    "orange": "medium",
-    "yellow": "low",
-    "gray": "holiday",
-    "": "unknown",
-}
-
-# Currencies tied to our instruments
-MONITORED_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "AUD", "CHF", "CAD", "NZD", "XAU", "BTC"}
-
-
 class ForexFactoryScraper:
-    """Fetches the economic calendar from ForexFactory."""
-
-    BASE_URL = FOREXFACTORY_URL
+    """Fetches economic calendar from TradingView API (public endpoint)."""
 
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update(REQUEST_HEADERS)
-        # ForexFactory needs these extra headers
         self.session.headers.update({
-            "Referer": "https://www.forexfactory.com/",
-            "Cache-Control": "no-cache",
+            **REQUEST_HEADERS,
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://www.tradingview.com/",
+            "Origin": "https://www.tradingview.com",
         })
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=3, max=15))
-    def _fetch(self, path: str = "/") -> Optional[BeautifulSoup]:
-        url = self.BASE_URL + path
+    # TradingView uses ISO country codes (2-letter), not currency codes
+    TV_COUNTRIES = "US,EU,GB,JP,AU,CA,CH,NZ"
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    def _fetch_calendar(self, from_dt: datetime, to_dt: datetime, min_importance: int = 1) -> list[dict]:
+        """Fetch events from TradingView economic calendar."""
+        params = {
+            "from": from_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "to": to_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "countries": self.TV_COUNTRIES,
+        }
         try:
-            resp = self.session.get(url, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            return BeautifulSoup(resp.text, "lxml")
+            r = self.session.get(TV_CALENDAR_URL, params=params, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+            events = data.get("result", [])
+            logger.debug(f"TradingView calendar: {len(events)} events fetched")
+            return events
         except Exception as e:
-            logger.warning(f"ForexFactory fetch error for {url}: {e}")
+            logger.warning(f"TradingView calendar fetch error: {e}")
             raise
 
-    def _parse_impact(self, row) -> str:
-        """Extract impact level from a calendar row."""
-        # ForexFactory uses colored icons/spans for impact
-        impact_el = row.find(class_=lambda c: c and "impact" in c.lower())
-        if impact_el:
-            # Check for icon classes or span colors
-            for color, label in IMPACT_MAP.items():
-                if color and color in str(impact_el):
-                    return label
-            text = impact_el.get_text(strip=True).lower()
-            for color, label in IMPACT_MAP.items():
-                if color in text:
-                    return label
-        return "unknown"
+    def _normalize_event(self, ev: dict) -> dict:
+        """Normalize a TradingView event to our standard format."""
+        importance_raw = ev.get("importance", 1)
+        impact = IMPORTANCE_MAP.get(importance_raw, "unknown")
+        currency = ev.get("currency", "").upper()
 
-    def _parse_calendar_row(self, row) -> Optional[dict]:
-        """Parse a single row from the FF calendar table."""
+        # Parse datetime
+        date_str = ""
+        time_str = ""
         try:
-            cells = row.find_all(["td", "th"])
-            if len(cells) < 5:
-                return None
+            dt_raw = ev.get("date", "")
+            if dt_raw:
+                dt = datetime.fromisoformat(dt_raw.replace("Z", "+00:00"))
+                # Convert to local display (keep UTC for now)
+                date_str = dt.strftime("%Y-%m-%d")
+                time_str = dt.strftime("%H:%M")
+        except Exception:
+            pass
 
-            # ForexFactory calendar columns:
-            # date | time | currency | impact | event | actual | forecast | previous
-            event = {
-                "date": "",
-                "time": "",
-                "currency": "",
-                "impact": "unknown",
-                "title": "",
-                "actual": "",
-                "forecast": "",
-                "previous": "",
-                "surprise": "unknown",
-                "is_high_impact": False,
-            }
+        actual = ev.get("actual")
+        forecast = ev.get("forecast")
+        previous = ev.get("previous")
 
-            # Extract text from each cell
-            texts = [c.get_text(strip=True) for c in cells]
+        # Format values
+        unit = ev.get("unit", "")
+        def fmt_val(v):
+            if v is None:
+                return ""
+            try:
+                if unit == "%":
+                    return f"{v:.2f}%"
+                elif abs(float(v)) >= 1000:
+                    return f"{v:,.1f}{unit}"
+                return f"{v}{unit}"
+            except Exception:
+                return str(v)
 
-            # The calendar table structure varies; try to extract key fields
-            if len(texts) >= 8:
-                event["date"] = texts[0]
-                event["time"] = texts[1]
-                event["currency"] = texts[2].upper()
-                event["impact"] = self._parse_impact(row)
-                event["title"] = texts[4]
-                event["actual"] = texts[5]
-                event["forecast"] = texts[6]
-                event["previous"] = texts[7]
-            elif len(texts) >= 5:
-                event["currency"] = texts[1].upper() if len(texts) > 1 else ""
-                event["impact"] = self._parse_impact(row)
-                event["title"] = texts[3] if len(texts) > 3 else texts[-1]
+        # Surprise direction
+        surprise = "unknown"
+        if actual is not None and forecast is not None:
+            try:
+                a, f = float(actual), float(forecast)
+                if a > f:
+                    surprise = "beat"
+                elif a < f:
+                    surprise = "miss"
+                else:
+                    surprise = "inline"
+            except Exception:
+                pass
 
-            event["is_high_impact"] = event["impact"] == "high"
-
-            # Calculate surprise direction
-            if event["actual"] and event["forecast"]:
-                try:
-                    actual = float(event["actual"].replace("%", "").replace("K", "").replace("M", ""))
-                    forecast = float(event["forecast"].replace("%", "").replace("K", "").replace("M", ""))
-                    if actual > forecast:
-                        event["surprise"] = "beat"
-                    elif actual < forecast:
-                        event["surprise"] = "miss"
-                    else:
-                        event["surprise"] = "inline"
-                except ValueError:
-                    event["surprise"] = "unknown"
-
-            if not event["title"]:
-                return None
-            return event
-        except Exception as e:
-            logger.debug(f"Row parse error: {e}")
-            return None
-
-    def _extract_calendar_text(self, soup: BeautifulSoup) -> str:
-        """Extract clean calendar text for Claude."""
-        if soup is None:
-            return ""
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-            tag.decompose()
-        text = soup.get_text(separator="\n", strip=True)
-        lines = [line for line in text.splitlines() if line.strip()]
-        return "\n".join(lines)
+        return {
+            "id": str(ev.get("id", "")),
+            "date": date_str,
+            "time": time_str,
+            "currency": currency,
+            "impact": impact,
+            "title": ev.get("title", ""),
+            "indicator": ev.get("indicator", ""),
+            "actual": fmt_val(actual),
+            "forecast": fmt_val(forecast),
+            "previous": fmt_val(previous),
+            "surprise": surprise,
+            "is_high_impact": impact == "high",
+            "period": ev.get("period", ""),
+            "source": ev.get("source", ""),
+        }
 
     def _get_currencies_in_focus(self, events: list[dict]) -> list[str]:
-        """Return currencies with high-impact events."""
         currencies = set()
         for ev in events:
             if ev.get("is_high_impact") and ev.get("currency") in MONITORED_CURRENCIES:
@@ -177,88 +150,110 @@ class ForexFactoryScraper:
         return sorted(currencies)
 
     def _extract_recurring_themes(self, events: list[dict]) -> list[str]:
-        """Identify recurring economic themes from event titles."""
         themes = []
         keywords = {
-            "CPI": "Inflation",
-            "PPI": "Producer Inflation",
-            "NFP": "Non-Farm Payrolls",
-            "GDP": "GDP Growth",
-            "PMI": "Business Activity (PMI)",
-            "FOMC": "Fed Policy Decision",
-            "ECB": "ECB Policy Decision",
-            "BOE": "Bank of England Decision",
-            "BOJ": "Bank of Japan Decision",
-            "Retail Sales": "Consumer Spending",
-            "Interest Rate": "Central Bank Rate Decision",
-            "Unemployment": "Labor Market",
-            "Employment": "Labor Market",
-            "Trade Balance": "Trade Balance",
-            "Inflation": "Inflation",
+            "CPI": "Inflazione (CPI)",
+            "PPI": "Inflazione Produttori (PPI)",
+            "Non-Farm": "Non-Farm Payrolls (NFP)",
+            "Nonfarm": "Non-Farm Payrolls (NFP)",
+            "GDP": "PIL / GDP",
+            "PMI": "Attività Economica (PMI)",
+            "FOMC": "Decisione Fed (FOMC)",
+            "ECB": "Decisione BCE",
+            "BOE": "Decisione Bank of England",
+            "BOJ": "Decisione Bank of Japan",
+            "Retail Sales": "Vendite al Dettaglio",
+            "Interest Rate": "Decisione Tassi",
+            "Unemployment": "Mercato del Lavoro",
+            "Employment": "Mercato del Lavoro",
+            "Trade Balance": "Bilancia Commerciale",
+            "Inflation": "Inflazione",
+            "Housing": "Mercato Immobiliare",
+            "ISM": "Sondaggi ISM",
+            "Consumer Confidence": "Fiducia Consumatori",
         }
         found = set()
         for ev in events:
-            title = ev.get("title", "")
-            for keyword, theme in keywords.items():
-                if keyword.lower() in title.lower() and theme not in found:
+            title = ev.get("title", "") + " " + ev.get("indicator", "")
+            for kw, theme in keywords.items():
+                if kw.lower() in title.lower() and theme not in found:
                     found.add(theme)
                     themes.append(theme)
         return themes
 
+    def _build_calendar_text(self, events_today: list, events_week: list) -> str:
+        lines = [f"=== CALENDARIO ECONOMICO — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} ===\n"]
+
+        # Today's events
+        today_high = [e for e in events_today if e.get("is_high_impact")]
+        today_med = [e for e in events_today if e.get("impact") == "medium"]
+
+        lines.append(f"── OGGI ({len(events_today)} eventi, {len(today_high)} HIGH IMPACT) ──")
+        for ev in events_today:
+            if ev.get("impact") in ("high", "medium"):
+                actual_str = f"  → Actual: {ev['actual']}" if ev.get("actual") else ""
+                surprise_str = f" [{ev['surprise'].upper()}]" if ev.get("surprise") not in ("unknown", "") else ""
+                lines.append(
+                    f"  {ev['time']} [{ev['currency']}] [{ev['impact'].upper()}] {ev['title']}"
+                    f"  Prev: {ev.get('previous','')}  Forecast: {ev.get('forecast','')}"
+                    f"{actual_str}{surprise_str}"
+                )
+
+        # This week — high impact only
+        week_high = [e for e in events_week if e.get("is_high_impact") and e.get("currency") in MONITORED_CURRENCIES]
+        if week_high:
+            lines.append(f"\n── SETTIMANA — HIGH IMPACT ({len(week_high)} eventi) ──")
+            for ev in week_high[:25]:
+                lines.append(
+                    f"  {ev['date']} {ev['time']} [{ev['currency']}] {ev['title']}"
+                    f"  Forecast: {ev.get('forecast','')}  Prec: {ev.get('previous','')}"
+                )
+
+        return "\n".join(lines)
+
     def fetch_calendar(self) -> ForexFactorySnapshot:
-        """Fetch today's and this week's economic calendar."""
-        logger.info("Fetching ForexFactory calendar...")
+        logger.info("Fetching economic calendar from TradingView...")
         timestamp = datetime.utcnow().isoformat()
-        all_text_parts = []
-        events_today = []
-        events_week = []
 
-        # Fetch today's calendar
+        now = datetime.now(timezone.utc)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end = today_start + timedelta(days=1)
+        week_end = today_start + timedelta(days=7)
+
+        # Fetch today
+        events_today_raw = []
         try:
-            soup_today = self._fetch("/calendar")
-            if soup_today:
-                text = self._extract_calendar_text(soup_today)
-                all_text_parts.append(f"=== FOREXFACTORY CALENDAR (TODAY) ===\n{text}")
-
-                cal_table = soup_today.find("table", class_=lambda c: c and "calendar" in str(c).lower())
-                if cal_table:
-                    rows = cal_table.find_all("tr")
-                    for row in rows:
-                        parsed = self._parse_calendar_row(row)
-                        if parsed:
-                            events_today.append(parsed)
+            events_today_raw = self._fetch_calendar(today_start, today_end)
         except Exception as e:
-            logger.error(f"ForexFactory today fetch failed: {e}")
+            logger.error(f"Today calendar fetch failed: {e}")
 
-        time.sleep(1)
+        time.sleep(0.8)
 
-        # Fetch this week's calendar
+        # Fetch this week
+        events_week_raw = []
         try:
-            soup_week = self._fetch("/calendar?week=this")
-            if soup_week:
-                text = self._extract_calendar_text(soup_week)
-                all_text_parts.append(f"\n=== FOREXFACTORY CALENDAR (THIS WEEK) ===\n{text}")
-
-                cal_table = soup_week.find("table", class_=lambda c: c and "calendar" in str(c).lower())
-                if cal_table:
-                    rows = cal_table.find_all("tr")
-                    for row in rows:
-                        parsed = self._parse_calendar_row(row)
-                        if parsed:
-                            events_week.append(parsed)
+            events_week_raw = self._fetch_calendar(today_start, week_end)
         except Exception as e:
-            logger.error(f"ForexFactory week fetch failed: {e}")
+            logger.error(f"Week calendar fetch failed: {e}")
 
-        # Identify high impact upcoming
+        # Normalize
+        events_today = [self._normalize_event(e) for e in events_today_raw]
+        events_week = [self._normalize_event(e) for e in events_week_raw]
+
+        # High impact upcoming (next 48h)
+        two_days_end = today_start + timedelta(days=2)
         high_impact = [
             ev for ev in events_week
             if ev.get("is_high_impact") and ev.get("currency") in MONITORED_CURRENCIES
         ]
 
-        raw_text = "\n".join(all_text_parts)
+        recurring_themes = self._extract_recurring_themes(events_week)
+        currencies_in_focus = self._get_currencies_in_focus(events_week)
+        raw_text = self._build_calendar_text(events_today, events_week)
+
         logger.info(
-            f"ForexFactory: {len(events_today)} events today, "
-            f"{len(events_week)} this week, {len(high_impact)} high-impact"
+            f"Calendar: {len(events_today)} today, {len(events_week)} this week, "
+            f"{len(high_impact)} high-impact, currencies: {currencies_in_focus}"
         )
 
         return ForexFactorySnapshot(
@@ -266,8 +261,8 @@ class ForexFactoryScraper:
             events_today=events_today,
             events_week=events_week,
             high_impact_upcoming=high_impact,
-            recurring_themes=self._extract_recurring_themes(events_week),
-            currencies_in_focus=self._get_currencies_in_focus(events_week),
+            recurring_themes=recurring_themes,
+            currencies_in_focus=currencies_in_focus,
             raw_text=raw_text,
         )
 

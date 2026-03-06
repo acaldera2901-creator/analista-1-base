@@ -23,8 +23,10 @@ def main():
         print(f"  ✅ WorldMonitor OK")
         print(f"  Timestamp: {snap.timestamp}")
         print(f"  Raw text length: {len(snap.raw_text)} chars")
-        print(f"  Indicators found: {len(snap.indicators)}")
-        print(f"  Central banks found: {len(snap.central_banks)}")
+        print(f"  Prices fetched: {len(snap.prices)}")
+        print(f"  Central bank rates: {len(snap.central_bank_rates)}")
+        print(f"  Economic indicators: {len(snap.economic_indicators)}")
+        print(f"  News headlines: {len(snap.news_headlines)}")
         if snap.raw_text:
             preview = snap.raw_text[:300].replace('\n', ' ')
             print(f"  Preview: {preview}...")
