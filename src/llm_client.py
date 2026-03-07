@@ -62,6 +62,24 @@ class GeminiClient:
         )
         return response.text or ""
 
+    def call_with_history(self, messages: list[dict], max_tokens: int = 2048) -> str:
+        from google.genai import types as t
+        system = next((m["content"] for m in messages if m["role"] == "system"), "")
+        contents = [
+            t.Content(role=m["role"], parts=[t.Part(text=m["content"])])
+            for m in messages if m["role"] != "system"
+        ]
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=contents,
+            config=t.GenerateContentConfig(
+                system_instruction=system,
+                max_output_tokens=max_tokens,
+                temperature=0.7,
+            ),
+        )
+        return response.text or ""
+
     def stream(
         self,
         messages: list[dict],
@@ -100,7 +118,7 @@ class OpenAICompatClient:
     def __init__(self, base_url: str, api_key: str, model: str):
         try:
             from openai import OpenAI
-            self.client = OpenAI(base_url=base_url, api_key=api_key)
+            self.client = OpenAI(base_url=base_url, api_key=api_key, timeout=45.0)
         except ImportError:
             import httpx, json as _json
 
@@ -132,7 +150,10 @@ class OpenAICompatClient:
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
+        return self.call_with_history(messages, max_tokens)
 
+    def call_with_history(self, messages: list[dict], max_tokens: int = 2048) -> str:
+        """Send a full messages list (with history) and return response."""
         if hasattr(self.client, "chat"):
             resp = self.client.chat.completions.create(
                 model=self.model,
@@ -145,6 +166,8 @@ class OpenAICompatClient:
             return self.client.chat_complete(
                 {"model": self.model, "messages": messages, "max_tokens": max_tokens}
             )
+
+    # Keep call_with_history as an alias for the fallback path above (handled inside call_with_history)
 
     def stream(
         self,
@@ -197,6 +220,17 @@ class AnthropicClient:
             max_tokens=max_tokens,
             system=system,
             messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text or ""
+
+    def call_with_history(self, messages: list[dict], max_tokens: int = 2048) -> str:
+        system = next((m["content"] for m in messages if m["role"] == "system"), "")
+        history = [m for m in messages if m["role"] != "system"]
+        msg = self.client.messages.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            system=system,
+            messages=history,
         )
         return msg.content[0].text or ""
 

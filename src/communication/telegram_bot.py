@@ -248,16 +248,10 @@ class TelegramCommunicator:
         )
 
         try:
-            # Run sync generator in thread pool to avoid blocking event loop
             loop = asyncio.get_event_loop()
-
-            def _collect_response():
-                full = ""
-                for chunk in self.agent.chat(user_text):
-                    full += chunk
-                return full
-
-            full_response = await loop.run_in_executor(None, _collect_response)
+            full_response = await loop.run_in_executor(
+                None, lambda: self.agent.chat(user_text)
+            )
             await self._safe_reply(update, full_response)
 
             # Check if self-improvement should run after this analysis

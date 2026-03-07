@@ -12,8 +12,6 @@ Set LLM_PROVIDER=gemini|groq|openrouter|anthropic in .env to force a provider.
 
 import json
 from datetime import datetime
-from typing import Generator
-
 from loguru import logger
 
 from src.config import (
@@ -246,18 +244,19 @@ class FinancialAnalystAgent:
 
     # ── Interactive conversation ───────────────────────────────────────────────
 
-    def chat(self, user_message: str) -> Generator[str, None, None]:
-        """Stream a response, maintaining conversation history."""
+    # Max number of messages to keep in history (user+assistant pairs)
+    _MAX_HISTORY = 8
+
+    def chat(self, user_message: str) -> str:
+        """Return a response, maintaining a capped conversation history."""
         system = self._build_system_prompt() + "\n\n" + CONVERSATION_SYSTEM_ADDITION
 
-        # Enrich first message with market data context
+        # First message: inject compact market snapshot
         if not self.conversation_history:
-            market_context = (
-                f"\n\nDati di mercato correnti:\n"
-                f"WorldMonitor: {self._format_wm_data()[:1500]}\n"
-                f"ForexFactory: {self._format_ff_data()[:1500]}"
-            )
-            user_message_full = user_message + market_context
+            wm_brief = self._format_wm_data()[:800]
+            ff_brief = self._format_ff_data()[:800]
+            context_note = f"\n\n[SNAPSHOT MERCATO]\n{wm_brief}\n\nCALENDARIO:\n{ff_brief}"
+            user_message_full = user_message + context_note
         else:
             user_message_full = user_message
 
@@ -265,30 +264,26 @@ class FinancialAnalystAgent:
             self._llm.make_message("user", user_message_full)
         )
 
+        # Keep history bounded
+        if len(self.conversation_history) > self._MAX_HISTORY:
+            self.conversation_history = self.conversation_history[-self._MAX_HISTORY:]
+
         try:
-            full_response = ""
-            for chunk in self._llm.stream(self.conversation_history, system, max_tokens=4096):
-                full_response += chunk
-                yield chunk
+            # Build messages list with system prompt
+            messages = [{"role": "system", "content": system}] + self.conversation_history
+            response = self._llm.call_with_history(messages, max_tokens=2048)
 
             assistant_role = self._llm.assistant_role()
             self.conversation_history.append(
-                self._llm.make_message(assistant_role, full_response)
+                self._llm.make_message(assistant_role, response)
             )
-
-            # Persist conversation periodically
-            if len(self.conversation_history) % 10 == 0:
-                history_dicts = [
-                    {"role": m["role"], "content": m["content"]}
-                    for m in self.conversation_history
-                ]
-                self.memory.save_conversation(
-                    history_dicts,
-                    summary=f"Conversazione in corso ({len(self.conversation_history)} messaggi)",
-                )
+            return response
 
         except Exception as e:
             logger.error(f"Chat error: {e}")
+            # Remove unanswered user message to avoid corrupting history
+            if self.conversation_history and self.conversation_history[-1].get("role") == "user":
+                self.conversation_history.pop()
             raise
 
     def reset_conversation(self) -> None:
