@@ -158,7 +158,7 @@ class AnalystScheduler:
         """Fetch fresh market data from both sources."""
         logger.info("[Scheduler] Refreshing market data...")
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             wm_snap = await loop.run_in_executor(None, self.wm_scraper.fetch_all)
             ff_snap = await loop.run_in_executor(None, self.ff_scraper.fetch_calendar)
 
@@ -189,7 +189,7 @@ class AnalystScheduler:
         """Send an end-of-day market recap at 18:30."""
         logger.info("[Scheduler] Sending evening recap...")
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             def _generate():
                 wm_text = self.agent._format_wm_data()[:3000]
@@ -241,7 +241,7 @@ class AnalystScheduler:
                         self._sent_pre_event_alerts.add(alert_key)
                         logger.info(f"[Scheduler] Pre-event alert: {ev.get('title', '')}")
 
-                        loop = asyncio.get_event_loop()
+                        loop = asyncio.get_running_loop()
 
                         def _generate(event=ev):
                             prompt = (
@@ -296,7 +296,7 @@ class AnalystScheduler:
         """Run the weekly deep self-improvement review."""
         logger.info("[Scheduler] Running weekly self-improvement review...")
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             review = await loop.run_in_executor(None, self.self_improvement.run_review)
             if review:
                 summary = self.self_improvement.get_improvement_summary()

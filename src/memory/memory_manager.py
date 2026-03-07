@@ -264,32 +264,59 @@ class MemoryManager:
     # ── Context builder for Claude ────────────────────────────────────────────
 
     def build_memory_context(self) -> str:
-        """Build a concise memory context string to inject into Claude's system prompt."""
+        """Build a compact memory context string (< 300 tokens) for the system prompt."""
         profile = self.get_analyst_profile()
         patterns = self.get_recurring_patterns()
-        recent = self.get_recent_analyses(n=3)
-        si_log = self.get_self_improvement_log()
 
-        ctx_parts = [
-            f"ANALYST PROFILE: {json.dumps(profile, ensure_ascii=False)}",
+        parts = [
+            f"Analista: {profile.get('name', 'Marco')} | "
+            f"Analisi completate: {profile.get('analysis_count', 0)}"
         ]
 
-        if patterns.get("patterns"):
-            ctx_parts.append(f"LEARNED PATTERNS: {json.dumps(patterns['patterns'])}")
+        prefs = profile.get("learned_preferences", [])
+        if prefs:
+            parts.append(f"Preferenze utente: {', '.join(prefs[:3])}")
 
+        pats = patterns.get("patterns", [])
+        if pats:
+            parts.append(f"Pattern ricorrenti: {', '.join(pats[:3])}")
+
+        recent = self.get_recent_analyses(n=2)
         if recent:
-            ctx_parts.append("RECENT ANALYSES SUMMARY:")
-            for r in recent:
-                ts = r.get("timestamp", "")[:16]
-                typ = r.get("type", "")
-                analysis_preview = r.get("analysis", "")[:300]
-                ctx_parts.append(f"  [{ts}] [{typ}] {analysis_preview}...")
+            last = recent[0]
+            ts = last.get("timestamp", "")[:16]
+            preview = last.get("analysis", "")[:200].replace("\n", " ")
+            parts.append(f"Ultima analisi ({ts}): {preview}...")
 
-        if si_log:
-            last_review = si_log[-1]
-            ctx_parts.append(
-                f"LAST SELF-IMPROVEMENT REVIEW ({last_review.get('timestamp', '')[:10]}): "
-                f"{json.dumps(last_review)}"
-            )
+        return "\n".join(parts)
 
-        return "\n\n".join(ctx_parts)
+    # ── Active conversation persistence (cross-session memory) ────────────────
+
+    def save_active_conversation(self, messages: list[dict]) -> None:
+        """Persist current conversation to disk so it survives restarts."""
+        path = self.memory_dir / "active_conversation.json"
+        self._write_json(path, {
+            "timestamp": datetime.utcnow().isoformat(),
+            "messages": messages,
+        })
+
+    def get_active_conversation(self, max_age_hours: float = 4.0) -> list[dict]:
+        """
+        Load the last conversation if it was saved within max_age_hours.
+        Returns empty list if too old or not found.
+        """
+        path = self.memory_dir / "active_conversation.json"
+        data = self._read_json(path)
+        if not data or not data.get("messages"):
+            return []
+        try:
+            ts = datetime.fromisoformat(data["timestamp"])
+            age_hours = (datetime.utcnow() - ts).total_seconds() / 3600
+            if age_hours > max_age_hours:
+                logger.info(f"Active conversation too old ({age_hours:.1f}h), starting fresh.")
+                return []
+        except (ValueError, KeyError):
+            return []
+        msgs = data["messages"]
+        logger.info(f"Restored {len(msgs)} messages from previous session.")
+        return msgs

@@ -20,14 +20,15 @@ MIN_ALERT_IMPACT: str = os.getenv("MIN_ALERT_IMPACT", "high")
 # ── Instruments ───────────────────────────────────────────────────────────────
 _instruments_raw = os.getenv(
     "INSTRUMENTS",
-    "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCHF,USDCAD,NZDUSD,XAUUSD,BTCUSD",
+    "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCHF,USDCAD,NZDUSD,AUDJPY,EURJPY,GBPJPY,XAUUSD,XAGUSD,BTCUSD,ETHUSD",
 )
 INSTRUMENTS: list[str] = [i.strip() for i in _instruments_raw.split(",")]
 
 INSTRUMENT_GROUPS = {
     "forex_majors": ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCHF", "USDCAD", "NZDUSD"],
-    "commodities": ["XAUUSD"],
-    "crypto": ["BTCUSD"],
+    "forex_crosses": ["AUDJPY", "EURJPY", "GBPJPY"],
+    "commodities": ["XAUUSD", "XAGUSD"],
+    "crypto": ["BTCUSD", "ETHUSD"],
 }
 
 # ── LLM Provider ──────────────────────────────────────────────────────────────

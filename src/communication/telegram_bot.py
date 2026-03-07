@@ -157,20 +157,20 @@ class TelegramCommunicator:
         if not self._is_authorized(update):
             return
         profile = self.memory.get_analyst_profile()
+        hist_len = self.agent.get_conversation_length()
+        session_note = f"Sessione ripristinata: {hist_len} messaggi in memoria." if hist_len > 0 else "Nuova sessione avviata."
         msg = (
-            f"*Benvenuto* - Sono *Marco*, il tuo Senior Speculative Financial Analyst.\n\n"
-            f"Analisi effettuate: {profile.get('analysis_count', 0)}\n"
-            f"Versione profilo: v{profile.get('version', 1)}\n\n"
-            f"Puoi scrivermi direttamente per qualsiasi analisi o domanda di mercato.\n\n"
-            f"*Comandi disponibili:*\n"
-            f"/briefing - Genera briefing mattutino ora\n"
+            f"Sono Marco, Senior Speculative Financial Analyst.\n\n"
+            f"Analisi completate: {profile.get('analysis_count', 0)}\n"
+            f"{session_note}\n\n"
+            f"Comandi:\n"
+            f"/briefing - Briefing mattutino immediato\n"
             f"/status - Stato del sistema\n"
-            f"/miglioramento - Report auto-miglioramento\n"
             f"/reset - Resetta la conversazione\n"
-            f"/help - Mostra questo messaggio\n\n"
-            f"Strumenti monitorati: EURUSD, GBPUSD, USDJPY, AUDUSD, USDCHF, USDCAD, NZDUSD, XAUUSD, BTCUSD"
+            f"/help - Questo messaggio\n\n"
+            f"Scrivi qualsiasi cosa per iniziare un'analisi."
         )
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(msg)
 
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._cmd_start(update, context)
@@ -180,7 +180,7 @@ class TelegramCommunicator:
             return
         await update.message.reply_text("Generando briefing mattutino, attendi...")
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             briefing = await loop.run_in_executor(
                 None, self.agent.generate_morning_briefing
             )
@@ -203,23 +203,22 @@ class TelegramCommunicator:
         has_briefing = self.memory.has_morning_briefing_today()
 
         msg = (
-            f"*STATUS SISTEMA*\n\n"
+            f"STATUS SISTEMA\n\n"
             f"Analista: {profile.get('name', 'Marco')}\n"
-            f"Versione profilo: v{profile.get('version', 1)}\n"
             f"Analisi totali: {profile.get('analysis_count', 0)}\n"
             f"Analisi oggi: {len(today_analyses)}\n"
             f"Briefing mattutino: {'Fatto' if has_briefing else 'Non ancora'}\n"
-            f"Messaggi in sessione: {self.agent.get_conversation_length()}\n"
+            f"Messaggi in memoria: {self.agent.get_conversation_length()}\n"
             f"Ultimo aggiornamento dati: {self._last_data_update}\n"
         )
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(msg)
 
     async def _cmd_self_improvement(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update):
             return
         await update.message.reply_text("Avvio revisione auto-miglioramento...")
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             review = await loop.run_in_executor(None, self.self_improvement.run_review)
             if review:
                 summary = self.self_improvement.get_improvement_summary()
@@ -348,7 +347,7 @@ class TelegramCommunicator:
         logger.info("Sending scheduled morning briefing via Telegram...")
         try:
             await self.send_message("Buongiorno! Ecco il briefing mattutino:")
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             briefing = await loop.run_in_executor(
                 None, self.agent.generate_morning_briefing
             )
@@ -361,7 +360,7 @@ class TelegramCommunicator:
         """Generate and send a proactive alert."""
         logger.info(f"Sending proactive alert: {alert_type}")
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             analysis = await loop.run_in_executor(
                 None,
                 lambda: self.agent.generate_proactive_alert(alert_type, trigger_data),
@@ -375,7 +374,7 @@ class TelegramCommunicator:
     async def _run_background_improvement(self) -> None:
         """Run self-improvement in background and notify if completed."""
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             review = await loop.run_in_executor(None, self.self_improvement.run_review)
             if review:
                 summary = self.self_improvement.get_improvement_summary()
@@ -386,56 +385,83 @@ class TelegramCommunicator:
 
 # ── Groq Vision helper (module-level) ────────────────────────────────────────
 
+# Groq vision models in priority order (first available wins)
+_GROQ_VISION_MODELS = [
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "llava-v1.5-7b-4096-preview",
+    "llama-3.2-11b-vision-preview",
+    "llama-3.2-90b-vision-preview",
+]
+
 def _groq_vision(b64_image: str, user_text: str, system: str) -> str:
     """
     Send a base64-encoded image + text to Groq's vision model.
-    Uses meta-llama/llama-4-scout-17b-16e-instruct (supports vision).
-    Falls back to plain text analysis if vision unavailable.
+    Tries multiple vision models in order; falls back to text-only if all fail.
     """
     if not GROQ_API_KEY:
         return "Nessuna chiave Groq configurata per l'analisi visiva."
 
+    from openai import OpenAI
+    client = OpenAI(
+        base_url="https://api.groq.com/openai/v1",
+        api_key=GROQ_API_KEY,
+        timeout=45.0,
+        max_retries=0,
+    )
+
+    full_prompt = (
+        "Sei Marco, Senior Speculative Financial Analyst di un hedge fund.\n"
+        "Analizza il grafico finanziario nell'immagine seguendo questo schema:\n\n"
+        "1. STRUTTURA E TIMEFRAME: strumento, TF, pattern visibili\n"
+        "2. TREND E MOMENTUM: direzione dominante, forza\n"
+        "3. LIVELLI CHIAVE: supporti, resistenze, zone demand/supply\n"
+        "4. PATTERN TECNICI: candlestick, formazioni grafiche\n"
+        "5. BIAS OPERATIVO: Long/Short/Neutro con motivazione\n"
+        "6. TRADE SETUP: entry, target, invalidazione\n\n"
+        f"Contesto: {user_text}"
+    )
+
+    messages = [
+        {"role": "system", "content": system},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}},
+                {"type": "text", "text": full_prompt},
+            ],
+        },
+    ]
+
+    last_error = None
+    for model in _GROQ_VISION_MODELS:
+        try:
+            resp = client.chat.completions.create(
+                model=model, messages=messages, max_tokens=1000, temperature=0.7,
+            )
+            logger.info(f"Vision analysis via {model}")
+            return resp.choices[0].message.content or "Nessuna risposta dal modello."
+        except Exception as e:
+            logger.warning(f"Vision model {model} failed: {e}")
+            last_error = e
+
+    # All vision models failed — do text-only analysis as fallback
+    logger.error(f"All vision models failed, using text fallback. Last error: {last_error}")
     try:
-        from openai import OpenAI
-        client = OpenAI(
-            base_url="https://api.groq.com/openai/v1",
-            api_key=GROQ_API_KEY,
-        )
-
-        full_prompt = (
-            "Sei Marco, Senior Speculative Financial Analyst di un hedge fund.\n"
-            "Analizza il grafico finanziario nell'immagine seguendo questo schema:\n\n"
-            "1. STRUTTURA E TIMEFRAME: Cosa mostri il grafico (strumento, TF, pattern visibili)\n"
-            "2. TREND E MOMENTUM: Direzione dominante, forza del trend\n"
-            "3. LIVELLI CHIAVE: Supporti, resistenze, zone demand/supply visibili\n"
-            "4. PATTERN TECNICI: Formazioni candlestick, pattern grafici rilevanti\n"
-            "5. BIAS OPERATIVO: Long/Short/Neutro con motivazione\n"
-            "6. TRADE SETUP: Entry, target, invalidazione\n\n"
-            f"Domanda/contesto utente: {user_text}"
-        )
-
-        response = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
+        text_resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{b64_image}"
-                            },
-                        },
-                        {"type": "text", "text": full_prompt},
-                    ],
-                },
+                {"role": "user", "content": (
+                    f"L'utente ha inviato uno screenshot di un grafico finanziario con questo commento: '{user_text}'.\n"
+                    "Non posso vedere l'immagine ma fornisci un'analisi generale basata sul contesto dell'utente, "
+                    "chiedendo dettagli specifici su strumento, timeframe e livelli visibili nel grafico."
+                )},
             ],
-            max_tokens=1500,
-            temperature=0.7,
+            max_tokens=600,
         )
-        return response.choices[0].message.content or "Nessuna risposta dal modello."
-
-    except Exception as e:
-        logger.error(f"Groq vision error: {e}")
-        return f"Errore analisi visiva: {str(e)[:200]}"
+        return (
+            "Analisi visiva non disponibile al momento. Rispondo al contesto:\n\n"
+            + (text_resp.choices[0].message.content or "")
+        )
+    except Exception as e2:
+        return f"Errore analisi grafico: {str(last_error)[:200]}"

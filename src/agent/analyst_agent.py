@@ -140,9 +140,13 @@ class FinancialAnalystAgent:
     def __init__(self, memory: MemoryManager):
         self.memory = memory
         self._llm = build_llm_client()
-        self.conversation_history: list[dict] = []
         self._last_wm_snapshot: WorldMonitorSnapshot | None = None
         self._last_ff_snapshot: ForexFactorySnapshot | None = None
+
+        # Restore conversation from previous session (if < 4 hours old)
+        self.conversation_history: list[dict] = memory.get_active_conversation(max_age_hours=4.0)
+        if self.conversation_history:
+            logger.info(f"Session restored: {len(self.conversation_history)} messages in history.")
 
     # ── Data management ───────────────────────────────────────────────────────
 
@@ -278,6 +282,8 @@ class FinancialAnalystAgent:
             self.conversation_history.append(
                 self._llm.make_message(assistant_role, response)
             )
+            # Persist immediately so restarts don't lose context
+            self.memory.save_active_conversation(self.conversation_history)
             return response
 
         except Exception as e:
