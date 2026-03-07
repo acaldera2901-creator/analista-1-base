@@ -206,7 +206,7 @@ class FinancialAnalystAgent:
         )
         system = self._build_system_prompt()
         try:
-            analysis = self._llm.call(prompt, system, max_tokens=8192)
+            analysis = self._llm.call(prompt, system, max_tokens=2500)
             raw_data = {
                 "worldmonitor_text": self._format_wm_data(),
                 "ff_events_today": self._last_ff_snapshot.events_today if self._last_ff_snapshot else [],
@@ -271,7 +271,8 @@ class FinancialAnalystAgent:
         try:
             # Build messages list with system prompt
             messages = [{"role": "system", "content": system}] + self.conversation_history
-            response = self._llm.call_with_history(messages, max_tokens=2048)
+            # 900 tokens output keeps total request well under Groq's 6000 TPM limit
+            response = self._llm.call_with_history(messages, max_tokens=900)
 
             assistant_role = self._llm.assistant_role()
             self.conversation_history.append(

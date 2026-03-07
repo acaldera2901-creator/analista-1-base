@@ -231,6 +231,11 @@ class TelegramCommunicator:
 
     # ── Message handler (conversational) ─────────────────────────────────────
 
+    @staticmethod
+    def _is_rate_limit(exc: Exception) -> bool:
+        t = type(exc).__name__.lower()
+        return "ratelimit" in t or "rate_limit" in t or "429" in str(exc)
+
     async def _handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_authorized(update):
             return
@@ -241,28 +246,47 @@ class TelegramCommunicator:
 
         logger.info(f"Message received: {user_text[:80]}")
 
-        # Show typing indicator
         await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id,
-            action="typing",
+            chat_id=update.effective_chat.id, action="typing"
         )
 
-        try:
-            loop = asyncio.get_event_loop()
-            full_response = await loop.run_in_executor(
-                None, lambda: self.agent.chat(user_text)
-            )
-            await self._safe_reply(update, full_response)
+        # Retry up to 3 times on rate limit, with user notification
+        wait_seconds = [30, 60, 120]
+        for attempt in range(len(wait_seconds) + 1):
+            try:
+                loop = asyncio.get_running_loop()
+                full_response = await loop.run_in_executor(
+                    None, lambda: self.agent.chat(user_text)
+                )
+                await self._safe_reply(update, full_response)
 
-            # Check if self-improvement should run after this analysis
-            if self.self_improvement.should_run_review():
-                asyncio.create_task(self._run_background_improvement())
+                if self.self_improvement.should_run_review():
+                    asyncio.create_task(self._run_background_improvement())
+                return
 
-        except Exception as e:
-            logger.error(f"Message handler error: {e}")
-            await update.message.reply_text(
-                f"Errore durante l'analisi: {str(e)[:200]}"
-            )
+            except Exception as e:
+                if self._is_rate_limit(e) and attempt < len(wait_seconds):
+                    wait = wait_seconds[attempt]
+                    logger.warning(f"Rate limit hit (attempt {attempt+1}), waiting {wait}s")
+                    await update.message.reply_text(
+                        f"Modello AI sotto carico, riprovo tra {wait} secondi..."
+                    )
+                    await asyncio.sleep(wait)
+                    await context.bot.send_chat_action(
+                        chat_id=update.effective_chat.id, action="typing"
+                    )
+                elif self._is_rate_limit(e):
+                    logger.error(f"Rate limit exhausted after retries: {e}")
+                    await update.message.reply_text(
+                        "Il modello AI e' sovraccarico. Riprova tra 1-2 minuti."
+                    )
+                    return
+                else:
+                    logger.error(f"Message handler error: {e}", exc_info=True)
+                    await update.message.reply_text(
+                        f"Errore durante l'analisi: {str(e)[:200]}"
+                    )
+                    return
 
     # ── Photo/chart handler ────────────────────────────────────────────────────
 
@@ -285,7 +309,7 @@ class TelegramCommunicator:
             img_bytes = await tg_file.download_as_bytearray()
             b64_image = base64.b64encode(img_bytes).decode("utf-8")
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             def _vision_call():
                 return _groq_vision(
@@ -294,11 +318,21 @@ class TelegramCommunicator:
                     system=self.agent._build_system_prompt(),
                 )
 
-            response = await loop.run_in_executor(None, _vision_call)
-            await self._safe_reply(update, response)
+            for attempt in range(3):
+                try:
+                    response = await loop.run_in_executor(None, _vision_call)
+                    await self._safe_reply(update, response)
+                    return
+                except Exception as e2:
+                    if self._is_rate_limit(e2) and attempt < 2:
+                        wait = 30 * (attempt + 1)
+                        await update.message.reply_text(f"Riprovo analisi grafico tra {wait}s...")
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
 
         except Exception as e:
-            logger.error(f"Photo handler error: {e}")
+            logger.error(f"Photo handler error: {e}", exc_info=True)
             await update.message.reply_text(
                 f"Errore nell'analisi del grafico: {str(e)[:200]}"
             )

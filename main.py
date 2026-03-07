@@ -45,8 +45,7 @@ logger.add(
 def validate_config() -> bool:
     """Check that required environment variables are set."""
     missing = []
-    if not GOOGLE_API_KEY:
-        missing.append("GOOGLE_API_KEY")
+    # GOOGLE_API_KEY optional — Groq/OpenRouter/Anthropic are valid fallbacks
     if not TELEGRAM_BOT_TOKEN:
         missing.append("TELEGRAM_BOT_TOKEN")
     if not TELEGRAM_CHAT_ID:

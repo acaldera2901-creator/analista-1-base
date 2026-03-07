@@ -118,7 +118,9 @@ class OpenAICompatClient:
     def __init__(self, base_url: str, api_key: str, model: str):
         try:
             from openai import OpenAI
-            self.client = OpenAI(base_url=base_url, api_key=api_key, timeout=45.0)
+            # max_retries=0: disables silent auto-retries that cause 2-3 min hangs
+            # on Groq rate limit (429). We handle retries explicitly in the caller.
+            self.client = OpenAI(base_url=base_url, api_key=api_key, timeout=45.0, max_retries=0)
         except ImportError:
             import httpx, json as _json
 
