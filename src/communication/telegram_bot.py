@@ -36,7 +36,7 @@ TG_MAX_CHARS = 4000
 
 
 def split_message(text: str, max_len: int = TG_MAX_CHARS) -> list[str]:
-    """Split a long message into Telegram-sized chunks, respecting markdown."""
+    """Split a long message into Telegram-sized chunks."""
     if len(text) <= max_len:
         return [text]
 
@@ -54,15 +54,31 @@ def split_message(text: str, max_len: int = TG_MAX_CHARS) -> list[str]:
     return chunks or [text[:max_len]]
 
 
-def _clean_markdown(text: str) -> str:
-    """Strip markdown formatting for plain-text fallback."""
+def _to_telegram(text: str) -> str:
+    """
+    Convert LLM markdown to clean plain text suitable for Telegram.
+    Telegram MARKDOWN v1 does NOT support ###, **, ---  etc.
+    We convert to readable plain text instead of risking parse errors.
+    """
     import re
-    text = re.sub(r"#{1,6}\s+", "", text)          # ### headings
-    text = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", text)  # bold/italic
-    text = re.sub(r"_{1,2}([^_]+)_{1,2}", r"\1", text)    # underline/italic
-    text = re.sub(r"`{1,3}([^`]*)`{1,3}", r"\1", text)    # code
-    text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text) # links
-    return text
+    # ### Heading → HEADING (uppercase for visual hierarchy)
+    text = re.sub(r"^#{1,6}\s+(.+)$", lambda m: m.group(1).upper(), text, flags=re.MULTILINE)
+    # **bold** or __bold__ → text (strip)
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    # *italic* → text
+    text = re.sub(r"(?<!\w)\*(.+?)\*(?!\w)", r"\1", text)
+    # _italic_ → text
+    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", text)
+    # ```code``` or `code` → text
+    text = re.sub(r"`{1,3}([^`]*)`{1,3}", r"\1", text)
+    # [link](url) → link
+    text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
+    # --- separators → blank line
+    text = re.sub(r"^-{3,}$", "", text, flags=re.MULTILINE)
+    # Collapse 3+ blank lines to 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 class TelegramCommunicator:
@@ -117,39 +133,23 @@ class TelegramCommunicator:
     # ── Safe send helpers ─────────────────────────────────────────────────────
 
     async def _safe_reply(self, update: Update, text: str) -> None:
-        """Send reply with Markdown; fallback to plain text on parse error."""
-        chunks = split_message(text)
+        """Send reply as clean plain text (no parse_mode — always works)."""
+        chunks = split_message(_to_telegram(text))
         for chunk in chunks:
-            try:
-                await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
-            except BadRequest as e:
-                if "parse" in str(e).lower() or "entities" in str(e).lower():
-                    await update.message.reply_text(_clean_markdown(chunk))
-                else:
-                    raise
+            await update.message.reply_text(chunk)
 
     async def _safe_send(self, text: str) -> None:
-        """Send proactive message; fallback to plain text on parse error."""
+        """Send proactive message as clean plain text."""
         if not self._allowed_chat_id:
             logger.warning("No TELEGRAM_CHAT_ID configured")
             return
         bot = self.app.bot if self.app else Bot(token=TELEGRAM_BOT_TOKEN)
-        chunks = split_message(text)
+        chunks = split_message(_to_telegram(text))
         for chunk in chunks:
             try:
-                await bot.send_message(
-                    chat_id=self._allowed_chat_id,
-                    text=chunk,
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-            except BadRequest as e:
-                if "parse" in str(e).lower() or "entities" in str(e).lower():
-                    await bot.send_message(
-                        chat_id=self._allowed_chat_id,
-                        text=_clean_markdown(chunk),
-                    )
-                else:
-                    logger.error(f"Telegram send error: {e}")
+                await bot.send_message(chat_id=self._allowed_chat_id, text=chunk)
+            except Exception as e:
+                logger.error(f"Telegram send error: {e}")
 
     # ── Command handlers ──────────────────────────────────────────────────────
 
