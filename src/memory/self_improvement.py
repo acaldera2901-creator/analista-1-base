@@ -1,23 +1,22 @@
 """
 Self-Improvement Engine — periodically reviews past analyses,
 identifies strengths/weaknesses, and updates the analyst profile.
-Uses Gemini to perform the meta-analysis.
+Uses the shared LLM client (same provider as the rest of the system).
 """
 
 import json
 from datetime import datetime
 
-from google import genai
-from google.genai import types
 from loguru import logger
 
-from src.config import GEMINI_MODEL, SELF_IMPROVEMENT_LOOKBACK, GOOGLE_API_KEY
+from src.config import SELF_IMPROVEMENT_LOOKBACK
 from src.memory.memory_manager import MemoryManager
+from src.llm_client import build_llm_client
 
 
 SELF_IMPROVEMENT_PROMPT = """
 Sei il motore di auto-miglioramento di un analista finanziario speculativo AI.
-Il tuo compito è analizzare le analisi di mercato passate e identificare:
+Il tuo compito e' analizzare le analisi di mercato passate e identificare:
 
 1. PUNTI DI FORZA: Dove l'analista ha ragionato bene?
 2. PUNTI DEBOLI: Dove l'analisi era superficiale, imprecisa o mancava di elementi chiave?
@@ -30,7 +29,7 @@ Analisi passate da esaminare:
 Profilo attuale dell'analista:
 {analyst_profile}
 
-Rispondi SEMPRE in formato JSON con questa struttura:
+Rispondi SEMPRE in formato JSON con questa struttura esatta:
 {{
   "strengths": ["lista di punti di forza identificati"],
   "weaknesses": ["lista di punti deboli identificati"],
@@ -47,7 +46,12 @@ class SelfImprovementEngine:
 
     def __init__(self, memory: MemoryManager):
         self.memory = memory
-        self.client = genai.Client(api_key=GOOGLE_API_KEY)
+        # Use the same LLM client as the rest of the system (not Gemini hardcoded)
+        try:
+            self._llm = build_llm_client()
+        except Exception as e:
+            logger.warning(f"SelfImprovementEngine: LLM not available: {e}")
+            self._llm = None
 
     def should_run_review(self) -> bool:
         """Decide if a self-improvement review should run now."""
@@ -56,16 +60,18 @@ class SelfImprovementEngine:
         count = profile.get("analysis_count", 0)
         log = self.memory.get_self_improvement_log()
 
-        # Always run if no reviews yet
         if not log:
             return count >= 3
 
-        # Run every N analyses
         last_review_count = log[-1].get("analysis_count_at_review", 0)
         return (count - last_review_count) >= SELF_IMPROVEMENT_FREQUENCY
 
     def run_review(self) -> dict:
-        """Execute a self-improvement review using Claude."""
+        """Execute a self-improvement review using the shared LLM client."""
+        if self._llm is None:
+            logger.warning("Self-improvement: LLM client not available, skipping.")
+            return {}
+
         logger.info("Running self-improvement review...")
 
         recent_analyses = self.memory.get_recent_analyses(n=SELF_IMPROVEMENT_LOOKBACK)
@@ -73,16 +79,17 @@ class SelfImprovementEngine:
             logger.info("No analyses to review yet.")
             return {}
 
-        # Build analyses text
         analyses_parts = []
         for i, rec in enumerate(recent_analyses, 1):
             ts = rec.get("timestamp", "")[:16]
             typ = rec.get("type", "unknown")
             analysis = rec.get("analysis", "")
-            analyses_parts.append(f"[{i}] [{ts}] Tipo: {typ}\n{analysis[:800]}")
+            analyses_parts.append(f"[{i}] [{ts}] Tipo: {typ}\n{analysis[:600]}")
 
         analyses_text = "\n\n---\n\n".join(analyses_parts)
-        analyst_profile = json.dumps(self.memory.get_analyst_profile(), ensure_ascii=False, indent=2)
+        analyst_profile = json.dumps(
+            self.memory.get_analyst_profile(), ensure_ascii=False, indent=2
+        )
 
         prompt = SELF_IMPROVEMENT_PROMPT.format(
             analyses_text=analyses_text,
@@ -90,31 +97,26 @@ class SelfImprovementEngine:
         )
 
         try:
-            response = self.client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    max_output_tokens=4096,
-                    temperature=0.3,
-                ),
+            system = (
+                "Sei un sistema di meta-analisi. Rispondi SOLO con JSON valido, "
+                "senza testo extra prima o dopo."
             )
-            text = response.text or ""
+            text = self._llm.call(prompt, system, max_tokens=1000)
 
-            # Extract JSON from response
             review = self._parse_json_response(text)
             if not review:
                 logger.warning("Self-improvement: could not parse JSON response")
                 return {}
 
-            # Update analyst profile with new insights
             profile = self.memory.get_analyst_profile()
             current_strengths = profile.get("strengths", [])
             current_weaknesses = profile.get("weaknesses", [])
             current_patterns = self.memory.get_recurring_patterns().get("patterns", [])
 
-            new_strengths = list(set(current_strengths + review.get("strengths", [])))[-20:]
-            new_weaknesses = list(set(current_weaknesses + review.get("weaknesses", [])))[-20:]
-            new_patterns = list(set(current_patterns + review.get("learned_patterns", [])))[-30:]
+            # Merge and deduplicate, keeping last 15 of each
+            new_strengths = list(dict.fromkeys(review.get("strengths", []) + current_strengths))[:15]
+            new_weaknesses = list(dict.fromkeys(review.get("weaknesses", []) + current_weaknesses))[:15]
+            new_patterns = list(dict.fromkeys(review.get("learned_patterns", []) + current_patterns))[:20]
 
             self.memory.update_analyst_profile({
                 "strengths": new_strengths,
@@ -123,7 +125,6 @@ class SelfImprovementEngine:
             })
             self.memory.update_recurring_patterns(new_patterns)
 
-            # Save the review
             review["analysis_count_at_review"] = profile.get("analysis_count", 0)
             self.memory.save_self_improvement_review(review)
 
@@ -140,16 +141,20 @@ class SelfImprovementEngine:
 
     @staticmethod
     def _parse_json_response(text: str) -> dict:
-        """Extract JSON from Claude's response."""
+        """Extract JSON from LLM response, handling markdown code blocks."""
         import re
+
+        # Strip markdown code fences if present
+        text = re.sub(r"```(?:json)?\s*", "", text).strip()
+
         # Try direct parse first
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
 
-        # Try to find JSON block in text
-        match = re.search(r"\{.*\}", text, re.DOTALL)
+        # Find first { ... } block (non-greedy to avoid capturing extra data)
+        match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group())
@@ -169,12 +174,12 @@ class SelfImprovementEngine:
             f"Ultima revisione: {last.get('timestamp', '')[:16]}",
             f"Valutazione: {last.get('overall_assessment', 'N/A')}",
             "",
-            "Punti di forza emersi:",
+            "Punti di forza:",
         ]
         for s in last.get("strengths", [])[:3]:
-            lines.append(f"  ✓ {s}")
+            lines.append(f"  + {s}")
         lines.append("\nAree di miglioramento:")
         for w in last.get("weaknesses", [])[:3]:
-            lines.append(f"  ⚠ {w}")
+            lines.append(f"  - {w}")
 
         return "\n".join(lines)

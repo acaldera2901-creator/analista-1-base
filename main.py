@@ -15,7 +15,7 @@ import sys
 from loguru import logger
 
 from src.config import (
-    GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ANALYST_TIMEZONE
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ANALYST_TIMEZONE, MORNING_BRIEFING_TIME
 )
 from src.memory.memory_manager import MemoryManager
 from src.agent.analyst_agent import FinancialAnalystAgent
@@ -90,19 +90,6 @@ async def main() -> None:
     except Exception as e:
         logger.warning(f"Initial data fetch error (continuing): {e}")
 
-    # Send startup notification
-    try:
-        profile = memory.get_analyst_profile()
-        await communicator.send_message(
-            f"🟢 *Analista avviato*\n"
-            f"Marco v{profile.get('version', 1)} è operativo.\n"
-            f"Analisi effettuate: {profile.get('analysis_count', 0)}\n"
-            f"Briefing mattutino programmato alle {MORNING_BRIEFING_TIME} ({ANALYST_TIMEZONE})\n\n"
-            f"Scrivi qualsiasi cosa per iniziare un'analisi, oppure usa /briefing per il report immediato."
-        )
-    except Exception as e:
-        logger.warning(f"Startup notification error: {e}")
-
     # Graceful shutdown handler
     stop_event = asyncio.Event()
 
@@ -119,6 +106,21 @@ async def main() -> None:
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
 
+        # Send startup notification AFTER bot is running
+        try:
+            profile = memory.get_analyst_profile()
+            conv = memory.get_active_conversation(max_age_hours=4.0)
+            conv_note = f"Sessione precedente ripristinata ({len(conv)} messaggi)." if conv else "Nessuna sessione precedente."
+            await communicator.send_message(
+                f"Analista avviato — Marco v{profile.get('version', 1)} operativo.\n"
+                f"Analisi totali: {profile.get('analysis_count', 0)}\n"
+                f"Briefing: {MORNING_BRIEFING_TIME} ({ANALYST_TIMEZONE})\n"
+                f"{conv_note}\n\n"
+                f"Scrivi per iniziare, oppure /briefing per il report immediato."
+            )
+        except Exception as e:
+            logger.warning(f"Startup notification error: {e}")
+
         logger.info("Agent is live. Press Ctrl+C to stop.")
         await stop_event.wait()
 
@@ -130,8 +132,6 @@ async def main() -> None:
 
     logger.info("Agent stopped cleanly.")
 
-
-from src.config import MORNING_BRIEFING_TIME  # re-import for the startup message
 
 if __name__ == "__main__":
     asyncio.run(main())
